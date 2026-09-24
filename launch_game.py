@@ -4,8 +4,12 @@ from playwright.sync_api import sync_playwright
 def main():
     print("Launching browser with remote debugging on port 9222...")
     with sync_playwright() as p:
-        # Launch chromium with remote debugging enabled
-        browser = p.chromium.launch(headless=False, args=['--remote-debugging-port=9222'])
+        # Launch chromium with remote debugging enabled and framerate unlocked
+        browser = p.chromium.launch(headless=False, args=[
+            '--remote-debugging-port=9222',
+            '--disable-frame-rate-limit', 
+            '--disable-gpu-vsync'
+        ])
         page = browser.new_page()
         
         print("Loading Bad Time Simulator...")

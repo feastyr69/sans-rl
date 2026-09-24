@@ -14,11 +14,13 @@ class SansEnv(gym.Env):
     """Custom Environment that follows gym interface for Sans Boss Fight"""
     metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 30}
 
-    def __init__(self, render_mode=None, mode="normal", attack_index=1):
+    def __init__(self, render_mode=None, mode="normal", attack_index=1, connect_remote=True, headless=True):
         super().__init__()
         self.render_mode = render_mode
         self.game_mode = mode
         self.attack_index = attack_index
+        self.connect_remote = connect_remote
+        self.headless = headless
         
         self.action_space = gym.spaces.Discrete(10)
         self.observation_space = gym.spaces.Box(
@@ -37,16 +39,30 @@ class SansEnv(gym.Env):
 
     def _start_browser(self):
         self.playwright = sync_playwright().start()
-        try:
-            # Connect to the manually launched browser
-            self.browser = self.playwright.chromium.connect_over_cdp("http://localhost:9222")
-            self.context = self.browser.contexts[0]
-            self.page = self.context.pages[0]
-            print("Connected to manual browser instance!")
-        except Exception as e:
-            print("Failed to connect to browser on port 9222.")
-            print("Make sure you run 'python launch_game.py' first!")
-            raise e
+        
+        if self.connect_remote:
+            try:
+                # Connect to the manually launched browser
+                self.browser = self.playwright.chromium.connect_over_cdp("http://localhost:9222")
+                self.context = self.browser.contexts[0]
+                self.page = self.context.pages[0]
+                print("Connected to manual browser instance!")
+                return
+            except Exception as e:
+                print("No manual browser found on port 9222. Launching optimized headless instance...")
+                
+        # Local instance (either explicitly requested or fallback)
+        self.browser = self.playwright.chromium.launch(
+            headless=self.headless,
+            args=["--disable-frame-rate-limit", "--disable-gpu-vsync"]
+        )
+        self.context = self.browser.new_context()
+        self.page = self.context.new_page()
+        self.page.goto(URL)
+        self.page.wait_for_selector('canvas')
+        
+        print("Browser instance ready! Waiting 10 seconds for game to load...")
+        time.sleep(10)
 
 
 
@@ -129,14 +145,25 @@ class SansEnv(gym.Env):
         super().reset(seed=seed)
         # We do NOT reload the page anymore since the browser is manually managed
         
-        # Press Enter a couple times to clear the Game Over screen.
-        # The agent itself will learn to press Enter to navigate menus and attack!
-        self.page.keyboard.press("Enter")
-        time.sleep(0.5)
-        self.page.keyboard.press("Enter")
-        time.sleep(0.5)
+        # Spam 'z' until the battle starts and a reward is achievable (red heart appears)
+        self.page.locator("canvas").click()
         
         obs, current_hp, has_red_heart = self._get_frame_and_hp()
+        
+        # Spam 'z' until the combat UI appears (indicated by a visible HP bar, current_hp > 0)
+        # This completely skips the Game Over screen, Main Menu, and Dialogue, 
+        # preventing the agent from gaining control on the Main Menu and switching modes.
+        print("Agent died. Skipping menus and dialogue to restart combat...")
+        while current_hp == 0:
+            self.page.keyboard.down("z")
+            time.sleep(0.05)
+            self.page.keyboard.up("z")
+            time.sleep(0.05)
+            
+            obs, current_hp, has_red_heart = self._get_frame_and_hp()
+            
+        print("Combat started! Agent taking control.")
+            
         self.last_hp = current_hp
         self.death_counter = 0
         info = {'hp': current_hp}
