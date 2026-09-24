@@ -13,7 +13,7 @@ def main():
     for i in range(100):
         action = env.action_space.sample()
         obs, reward, done, truncated, info = env.step(action)
-        print(f"Step {i+1}: Action={action}, Reward={reward}, Done={done}, Obs Shape={obs.shape}")
+        print(f"Step {i+1}: Action={action}, Reward={reward:.2f}, Done={done}, HP={info.get('hp', 'N/A')}")
         if done:
             print("Episode finished.")
             break
