@@ -20,6 +20,7 @@ ACTIONS = {
     6: ["ArrowUp", "ArrowRight"],
     7: ["ArrowDown", "ArrowLeft"],
     8: ["ArrowDown", "ArrowRight"],
+    9: ["Enter"],
 }
 
 # Reward scaling

@@ -4,7 +4,7 @@ from env.sans_env import SansEnv
 def main():
     print("Initializing environment...")
     # Setting render_mode="human" will launch Playwright with headless=False so you can see the game.
-    env = SansEnv(render_mode="human")
+    env = SansEnv(render_mode="human", mode="single", attack_index=1)
     print("Environment initialized.")
     
     obs, info = env.reset()
