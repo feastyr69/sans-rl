@@ -1,7 +1,7 @@
 # config.py
 
 # Game URL
-URL = "https://jcw87.github.io/c2-sans-fight/"
+URL = "http://localhost:8081/"
 
 # Canvas dimensions and crop
 CANVAS_WIDTH = 640

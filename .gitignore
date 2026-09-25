@@ -1,6 +1,13 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 logs/
 trained_models/
 .DS_Store
+
+# Temporary test and visualization scripts
+test_*.py
+render_cartpole.py
+sanity_check.py
+explore_js.py

@@ -1,6 +1,5 @@
 import gymnasium as gym
 import numpy as np
-import cv2
 from playwright.sync_api import sync_playwright
 import time
 import os
@@ -8,13 +7,15 @@ import sys
 
 # Add parent directory to path to import config
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import URL, TARGET_WIDTH, TARGET_HEIGHT, ACTIONS, REWARD_SURVIVAL, REWARD_DEATH
+from config import URL, ACTIONS, REWARD_SURVIVAL, REWARD_DEATH
+
+MAX_HAZARDS = 20
+NUM_FEATURES = 2 + (MAX_HAZARDS * 4)
 
 class SansEnv(gym.Env):
-    """Custom Environment that follows gym interface for Sans Boss Fight"""
-    metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 30}
+    metadata = {'render_modes': ['human'], 'render_fps': 60}
 
-    def __init__(self, render_mode=None, mode="normal", attack_index=1, connect_remote=True, headless=True):
+    def __init__(self, render_mode=None, mode="normal", attack_index=1, connect_remote=False, headless=True):
         super().__init__()
         self.render_mode = render_mode
         self.game_mode = mode
@@ -24,7 +25,7 @@ class SansEnv(gym.Env):
         
         self.action_space = gym.spaces.Discrete(10)
         self.observation_space = gym.spaces.Box(
-            low=0, high=255, shape=(TARGET_HEIGHT, TARGET_WIDTH, 1), dtype=np.uint8
+            low=-10000.0, high=10000.0, shape=(NUM_FEATURES,), dtype=np.float32
         )
 
         self.playwright = None
@@ -32,153 +33,244 @@ class SansEnv(gym.Env):
         self.context = None
         self.page = None
 
-        self.last_hp = 100
         self.death_counter = 0
-
+        self.steps_alive = 0
         self._start_browser()
 
     def _start_browser(self):
         self.playwright = sync_playwright().start()
         
-        if self.connect_remote:
-            try:
-                # Connect to the manually launched browser
-                self.browser = self.playwright.chromium.connect_over_cdp("http://localhost:9222")
-                self.context = self.browser.contexts[0]
-                self.page = self.context.pages[0]
-                print("Connected to manual browser instance!")
-                return
-            except Exception as e:
-                print("No manual browser found on port 9222. Launching optimized headless instance...")
-                
-        # Local instance (either explicitly requested or fallback)
+        # Local instance optimized for headless speed
         self.browser = self.playwright.chromium.launch(
             headless=self.headless,
-            args=["--disable-frame-rate-limit", "--disable-gpu-vsync"]
+            args=[
+                "--disable-frame-rate-limit", 
+                "--disable-gpu-vsync", 
+                "--autoplay-policy=no-user-gesture-required",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding"
+            ]
         )
         self.context = self.browser.new_context()
         self.page = self.context.new_page()
+        
+        # Spoof visibility so Construct 2 never pauses the game in background/headless mode
+        self.page.add_init_script("""
+            Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
+            Object.defineProperty(document, 'hidden', { get: () => false });
+            window.addEventListener('visibilitychange', (e) => e.stopImmediatePropagation(), true);
+        """)
+        
         self.page.goto(URL)
         self.page.wait_for_selector('canvas')
         
-        print("Browser instance ready! Waiting 10 seconds for game to load...")
-        time.sleep(10)
+        print(f"Browser instance ready! Targeting attack {self.attack_index}.")
+        time.sleep(3)
 
-
-
-    def _get_frame_and_hp(self):
+    def _get_state(self):
+        js_code = """
+        () => {
+            try {
+                const rt = cr_getC2Runtime();
+                if (!rt) return {alive: false};
+                
+        let soul = null;
+        let hazards = [];
+        let combatZoneExists = false;
+        
+        let seen = new Set();
+        function findObjects(obj, depth) {
+            if (depth > 3) return;
+            if (!obj || typeof obj !== 'object') return;
+            if (seen.has(obj)) return;
+            seen.add(obj);
+            
+            if (Array.isArray(obj)) {
+                if (obj.length > 0 && obj[0] && typeof obj[0] === 'object' && 'x' in obj[0] && 'y' in obj[0] && 'width' in obj[0]) {
+                    for (let inst of obj) {
+                        if (inst && typeof inst === 'object' && typeof inst.x === 'number') {
+                            let typeName = inst.type ? inst.type.name : "";
+                            
+                            // Combat Zone Border (t15) or Combat Zone (t14)
+                            if (typeName === 't15' || typeName === 't14') {
+                                combatZoneExists = true;
+                            }
+                            
+                            // Soul (t54)
+                            if (inst.width === 16 && inst.height === 16 && typeName === 't54' && !soul) {
+                                soul = {x: inst.x, y: inst.y};
+                            } 
+                            // Hazards (bones, blasters)
+                            else if (['t29', 't30', 't32', 't33', 't35', 't36', 't42'].includes(typeName)) {
+                                hazards.push({
+                                    x: inst.x,
+                                    y: inst.y,
+                                    w: inst.width,
+                                    h: inst.height
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    for (let i = 0; i < obj.length; i++) {
+                        findObjects(obj[i], depth + 1);
+                    }
+                }
+            } else {
+                for (let key in obj) {
+                    try { findObjects(obj[key], depth + 1); } catch(e) {}
+                }
+            }
+        }
+        findObjects(rt, 0);
+        
+        return {
+            alive: soul !== null && combatZoneExists,
+            soul: soul || {x: 0, y: 0},
+            hazards: hazards
+        };
+    } catch(e) {
+        return {alive: false};
+    }
+        }
+        """
         try:
-            # Force wait for WebGL to render to prevent visual glitches (black frames)
-            self.page.evaluate('() => new Promise(requestAnimationFrame)')
-            canvas = self.page.locator('canvas')
-            screenshot = canvas.screenshot(timeout=1000)
-            np_img = np.frombuffer(screenshot, dtype=np.uint8)
-            img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+            result = self.page.evaluate(js_code)
+            alive = result.get('alive', False)
+            soul = result.get('soul', {'x': 0, 'y': 0})
+            hazards = result.get('hazards', [])
             
-            # Check for the red heart presence (B<50, G<50, R>200)
-            red_mask = (img[:, :, 2] > 200) & (img[:, :, 1] < 50) & (img[:, :, 0] < 50)
-            has_red_heart = np.sum(red_mask) > 10
+            obs = np.zeros(NUM_FEATURES, dtype=np.float32)
+            obs[0] = soul['x']
+            obs[1] = soul['y']
             
-            # HP is a yellow bar at the bottom. We count the yellow pixels.
-            bottom_half = img[240:, :, :]
-            yellow_mask = (bottom_half[:, :, 2] > 200) & (bottom_half[:, :, 1] > 200) & (bottom_half[:, :, 0] < 50)
-            current_hp = np.sum(yellow_mask)
+            # Sort hazards by distance to soul
+            hazards.sort(key=lambda h: (h['x'] - soul['x'])**2 + (h['y'] - soul['y'])**2)
             
-            # Safeguard against WebGL flickering (black frames)
-            # If HP drops from >1000 to 0 instantly, it's a visual glitch.
-            if current_hp == 0 and getattr(self, 'last_hp', 0) > 1000:
-                current_hp = self.last_hp
-            
-            # Convert to grayscale for the agent
-            img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            img_resized = cv2.resize(img_gray, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_AREA)
-            obs = np.expand_dims(img_resized, axis=-1)
-            return obs, current_hp, has_red_heart
+            idx = 2
+            for h in hazards[:MAX_HAZARDS]:
+                obs[idx] = h['x'] - soul['x']
+                obs[idx+1] = h['y'] - soul['y']
+                obs[idx+2] = h['w']
+                obs[idx+3] = h['h']
+                idx += 4
+                
+            return obs, alive
         except Exception as e:
-            print(f"Screenshot failed: {e}")
-            return np.zeros((TARGET_HEIGHT, TARGET_WIDTH, 1), dtype=np.uint8), self.last_hp if hasattr(self, 'last_hp') else 2310, False
+            return np.zeros(NUM_FEATURES, dtype=np.float32), False
 
     def step(self, action):
         keys = ACTIONS[action]
-        
         for key in keys:
             self.page.keyboard.down(key)
         
-        # Action duration
-        time.sleep(1/30.0)
+        # Uncapped speed: very short sleep just for browser thread to register
+        time.sleep(1/60.0) 
         
         for key in keys:
             self.page.keyboard.up(key)
 
-        obs, current_hp, has_red_heart = self._get_frame_and_hp()
+        obs, alive = self._get_state()
         
-        # Calculate HP loss
-        hp_diff = current_hp - self.last_hp
-        self.last_hp = current_hp
-        
-        # Death is triggered if HP drops to 0 for a few consecutive frames
-        if current_hp == 0:
+        if not alive:
             self.death_counter += 1
         else:
             self.death_counter = 0
+            self.steps_alive += 1
             
-        done = self.death_counter >= 3
+        done = self.death_counter >= 2
         
-        # Reward function
-        reward = 0.0
-        if has_red_heart:
-            reward += REWARD_SURVIVAL
-            
-        if hp_diff < 0:
-            # Penalize losing HP (scaling pixel loss to reward penalty)
-            reward += hp_diff * 0.05
-            
+        # Reward is survival + a bonus if it survives a long time
+        reward = REWARD_SURVIVAL if alive else 0.0
         if done:
             reward = REWARD_DEATH
             
-        info = {'hp': current_hp}
-        truncated = False
-        
-        return obs, reward, done, truncated, info
+        info = {'steps_alive': self.steps_alive}
+        return obs, reward, done, False, info
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        # We do NOT reload the page anymore since the browser is manually managed
         
-        # Spam 'z' until the battle starts and a reward is achievable (red heart appears)
+        self.page.reload()
+        self.page.wait_for_selector('canvas')
+        time.sleep(1) # wait for game to init
+        
         self.page.locator("canvas").click()
         
-        obs, current_hp, has_red_heart = self._get_frame_and_hp()
+        # Wait for the main menu to load by checking for the cursor
+        js_cursor = """
+        () => {
+            const rt = cr_getC2Runtime();
+            let soul = null;
+            let seen = new Set();
+            function findObjects(obj, depth) {
+                if (depth > 3 || soul) return;
+                if (!obj || typeof obj !== 'object') return;
+                if (seen.has(obj)) return;
+                seen.add(obj);
+                if (Array.isArray(obj)) {
+                    if (obj.length > 0 && obj[0] && typeof obj[0] === 'object' && 'x' in obj[0] && 'y' in obj[0] && 'width' in obj[0]) {
+                        for (let inst of obj) {
+                            if (inst && typeof inst === 'object' && typeof inst.x === 'number') {
+                                let typeName = inst.type ? inst.type.name : "";
+                                if (inst.width === 16 && inst.height === 16 && typeName === 't54') {
+                                    soul = true;
+                                }
+                            }
+                        }
+                    } else {
+                        for (let i = 0; i < obj.length; i++) findObjects(obj[i], depth + 1);
+                    }
+                } else {
+                    for (let key in obj) {
+                        try { findObjects(obj[key], depth + 1); } catch(e) {}
+                    }
+                }
+            }
+            findObjects(rt, 0);
+            return soul;
+        }
+        """
         
-        # Spam 'z' until the combat UI appears (indicated by a visible HP bar, current_hp > 0)
-        # This completely skips the Game Over screen, Main Menu, and Dialogue, 
-        # preventing the agent from gaining control on the Main Menu and switching modes.
-        print("Agent died. Skipping menus and dialogue to restart combat...")
-        while current_hp == 0:
-            self.page.keyboard.down("z")
-            time.sleep(0.05)
-            self.page.keyboard.up("z")
-            time.sleep(0.05)
+        attempts = 0
+        while attempts < 100:
+            if self.page.evaluate(js_cursor):
+                break
+            time.sleep(0.1)
+            attempts += 1
             
-            obs, current_hp, has_red_heart = self._get_frame_and_hp()
+        # Navigate Main Menu -> Single Attack
+        for _ in range(3):
+            self.page.keyboard.press("ArrowDown", delay=50)
+            time.sleep(0.1)
+        self.page.keyboard.press("z", delay=50)
+        time.sleep(0.5)
+        
+        # Select attack in Single Attack menu
+        for _ in range(self.attack_index - 1):
+            self.page.keyboard.press("ArrowDown", delay=50)
+            time.sleep(0.1)
             
-        print("Combat started! Agent taking control.")
+        self.page.keyboard.press("z", delay=50)
+        time.sleep(0.5)
+        
+        # Skip any dialogue until soul spawns AND combat zone is present
+        obs, alive = self._get_state()
+        attempts = 0
+        while not alive and attempts < 100:
+            self.page.keyboard.press("z", delay=50)
+            time.sleep(0.1)
+            obs, alive = self._get_state()
+            attempts += 1
             
-        self.last_hp = current_hp
         self.death_counter = 0
-        info = {'hp': current_hp}
-        return obs, info
+        self.steps_alive = 0
+        return obs, {}
 
     def render(self):
-        if self.render_mode == 'rgb_array':
-            obs, _ = self._get_frame_and_hp()
-            return obs
+        pass
 
     def close(self):
-        # Do not close the page, context, or browser here.
-        # They are managed externally by launch_game.py.
-        # Closing them over CDP shuts down the remote Chromium instance, 
-        # which can cause GPU driver crashes (laptop crashes) and leaves 
-        # launch_game.py as a zombie process.
         if self.playwright:
             self.playwright.stop()
